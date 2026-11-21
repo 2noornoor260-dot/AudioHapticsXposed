@@ -25,9 +25,9 @@ class MainActivity : AppCompatActivity() {
         }
 
         val title = TextView(this).apply {
-            text = "إعدادات الاهتزاز الصوتي (Audio Haptics)"
+            text = "إعدادات الاهتزاز الصوتي المطور (v2.0)"
             textSize = 20f
-            setPadding(0, 0, 0, 32)
+            setPadding(0, 0, 0, 24)
         }
 
         val enableSwitch = SwitchMaterial(this).apply {
@@ -41,45 +41,33 @@ class MainActivity : AppCompatActivity() {
         }
 
         val radioGroup = RadioGroup(this).apply {
-            val rbBoth = RadioButton(context).apply {
-                id = 0
-                text = "التابلت + الإيربودز معاً (تجربة مزدوجة)"
-            }
-            val rbTablet = RadioButton(context).apply {
-                id = 1
-                text = "سماعات التابلت فقط"
-            }
-            val rbAirpods = RadioButton(context).apply {
-                id = 2
-                text = "الإيربودز (البلوتوث) فقط"
-            }
-            addView(rbBoth)
-            addView(rbTablet)
-            addView(rbAirpods)
+            addView(RadioButton(context).apply { id = 0; text = "التابلت (السماعات الـ 4) + الإيربودز معاً" })
+            addView(RadioButton(context).apply { id = 1; text = "سماعات التابلت الـ 4 فقط" })
+            addView(RadioButton(context).apply { id = 2; text = "الإيربودز (البلوتوث + Dolby Atmos) فقط" })
             check(prefs.getInt("outputMode", 0))
         }
 
-        val initFreq = prefs.getInt("freq", 60)
+        val initFreq = prefs.getInt("freq", 105)
         val freqLabel = TextView(this).apply {
-            text = "\nتردد الاهتزاز (50Hz - 100Hz): $initFreq Hz"
+            text = "\nتردد الموتور (75Hz - 145Hz): $initFreq Hz"
         }
 
         val freqSeek = SeekBar(this).apply {
-            max = 50
-            progress = initFreq - 50
+            max = 70
+            progress = initFreq - 75
             setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
                 override fun onProgressChanged(sb: SeekBar?, p: Int, fromUser: Boolean) {
-                    val currentFreq = p + 50
-                    freqLabel.text = "\nتردد الاهتزاز (50Hz - 100Hz): $currentFreq Hz"
+                    val currentFreq = p + 75
+                    freqLabel.text = "\nتردد الموتور (75Hz - 145Hz): $currentFreq Hz"
                 }
                 override fun onStartTrackingTouch(sb: SeekBar?) {}
                 override fun onStopTrackingTouch(sb: SeekBar?) {}
             })
         }
 
-        val initGain = prefs.getInt("gain", 85)
+        val initGain = prefs.getInt("gain", 90)
         val gainLabel = TextView(this).apply {
-            text = "\nقوة النبضة: $initGain%"
+            text = "\nقوة الاهتزاز: $initGain%"
         }
 
         val gainSeek = SeekBar(this).apply {
@@ -87,41 +75,26 @@ class MainActivity : AppCompatActivity() {
             progress = initGain
             setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
                 override fun onProgressChanged(sb: SeekBar?, p: Int, fromUser: Boolean) {
-                    gainLabel.text = "\nقوة النبضة: $p%"
+                    gainLabel.text = "\nقوة الاهتزاز: $p%"
                 }
                 override fun onStartTrackingTouch(sb: SeekBar?) {}
                 override fun onStopTrackingTouch(sb: SeekBar?) {}
             })
         }
 
-        val testBtn = Button(this).apply {
-            text = "حفظ وتجربة الاهتزاز الآن"
+        val testTapBtn = Button(this).apply {
+            text = "حفظ وتجربة نقرة لمس (Tap)"
             setOnClickListener {
-                val enabled = enableSwitch.isChecked
-                val mode = radioGroup.checkedRadioButtonId
-                val freq = freqSeek.progress + 50
-                val gain = gainSeek.progress
+                saveAndSync(prefs, enableSwitch.isChecked, radioGroup.checkedRadioButtonId, freqSeek.progress + 75, gainSeek.progress)
+                ToneGeneratorEngine.triggerVibration(this@MainActivity, 35L, 230)
+            }
+        }
 
-                prefs.edit()
-                    .putBoolean("enabled", enabled)
-                    .putInt("outputMode", mode)
-                    .putInt("freq", freq)
-                    .putInt("gain", gain)
-                    .apply()
-
-                ToneGeneratorEngine.enabled = enabled
-                ToneGeneratorEngine.outputMode = mode
-                ToneGeneratorEngine.frequencyHz = freq.toDouble()
-                ToneGeneratorEngine.volumeGain = gain / 100f
-                ToneGeneratorEngine.triggerPulse(this@MainActivity, 45L)
-
-                val intent = Intent(MainHook.ACTION_UPDATE_PREFS).apply {
-                    putExtra("enabled", enabled)
-                    putExtra("outputMode", mode)
-                    putExtra("freq", freq.toDouble())
-                    putExtra("gain", gain / 100f)
-                }
-                sendBroadcast(intent)
+        val testLongBtn = Button(this).apply {
+            text = "تجربة اهتزاز متواصل (1.5 ثانية)"
+            setOnClickListener {
+                saveAndSync(prefs, enableSwitch.isChecked, radioGroup.checkedRadioButtonId, freqSeek.progress + 75, gainSeek.progress)
+                ToneGeneratorEngine.triggerVibration(this@MainActivity, 1500L, 255)
             }
         }
 
@@ -133,8 +106,31 @@ class MainActivity : AppCompatActivity() {
         layout.addView(freqSeek)
         layout.addView(gainLabel)
         layout.addView(gainSeek)
-        layout.addView(testBtn)
+        layout.addView(testTapBtn)
+        layout.addView(testLongBtn)
 
         setContentView(layout)
+    }
+
+    private fun saveAndSync(prefs: android.content.SharedPreferences, enabled: Boolean, mode: Int, freq: Int, gain: Int) {
+        prefs.edit()
+            .putBoolean("enabled", enabled)
+            .putInt("outputMode", mode)
+            .putInt("freq", freq)
+            .putInt("gain", gain)
+            .apply()
+
+        ToneGeneratorEngine.enabled = enabled
+        ToneGeneratorEngine.outputMode = mode
+        ToneGeneratorEngine.baseFrequencyHz = freq.toDouble()
+        ToneGeneratorEngine.volumeGain = gain / 100f
+
+        val intent = Intent(MainHook.ACTION_UPDATE_PREFS).apply {
+            putExtra("enabled", enabled)
+            putExtra("outputMode", mode)
+            putExtra("freq", freq.toDouble())
+            putExtra("gain", gain / 100f)
+        }
+        sendBroadcast(intent)
     }
 }
