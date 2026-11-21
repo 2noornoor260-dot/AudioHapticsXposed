@@ -25,7 +25,7 @@ class MainActivity : AppCompatActivity() {
         }
 
         val title = TextView(this).apply {
-            text = "إعدادات الاهتزاز الصوتي المطور (v2.0)"
+            text = "إعدادات الاهتزاز الصوتي المطور (v3.0)"
             textSize = 20f
             setPadding(0, 0, 0, 24)
         }
@@ -41,9 +41,9 @@ class MainActivity : AppCompatActivity() {
         }
 
         val radioGroup = RadioGroup(this).apply {
-            addView(RadioButton(context).apply { id = 0; text = "التابلت (السماعات الـ 4) + الإيربودز معاً" })
-            addView(RadioButton(context).apply { id = 1; text = "سماعات التابلت الـ 4 فقط" })
-            addView(RadioButton(context).apply { id = 2; text = "الإيربودز (البلوتوث + Dolby Atmos) فقط" })
+            addView(RadioButton(context).apply { id = 0; text = "التابلت (السماعات الـ 4 + Dolby) + الإيربودز معاً" })
+            addView(RadioButton(context).apply { id = 1; text = "سماعات التابلت الـ 4 + Dolby Atmos فقط" })
+            addView(RadioButton(context).apply { id = 2; text = "الإيربودز (البلوتوث) فقط" })
             check(prefs.getInt("outputMode", 0))
         }
 
@@ -83,10 +83,10 @@ class MainActivity : AppCompatActivity() {
         }
 
         val testTapBtn = Button(this).apply {
-            text = "حفظ وتجربة نقرة لمس (Tap)"
+            text = "حفظ وتجربة نقرة لمس سريعة (Tap)"
             setOnClickListener {
                 saveAndSync(prefs, enableSwitch.isChecked, radioGroup.checkedRadioButtonId, freqSeek.progress + 75, gainSeek.progress)
-                ToneGeneratorEngine.triggerVibration(this@MainActivity, 35L, 230)
+                ToneGeneratorEngine.triggerVibration(this@MainActivity, 32L, 230)
             }
         }
 
@@ -113,6 +113,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun saveAndSync(prefs: android.content.SharedPreferences, enabled: Boolean, mode: Int, freq: Int, gain: Int) {
+        val modeChanged = ToneGeneratorEngine.outputMode != mode
         prefs.edit()
             .putBoolean("enabled", enabled)
             .putInt("outputMode", mode)
@@ -124,6 +125,9 @@ class MainActivity : AppCompatActivity() {
         ToneGeneratorEngine.outputMode = mode
         ToneGeneratorEngine.baseFrequencyHz = freq.toDouble()
         ToneGeneratorEngine.volumeGain = gain / 100f
+        if (modeChanged) {
+            ToneGeneratorEngine.requestTrackRebuild()
+        }
 
         val intent = Intent(MainHook.ACTION_UPDATE_PREFS).apply {
             putExtra("enabled", enabled)

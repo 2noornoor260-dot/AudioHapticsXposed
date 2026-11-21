@@ -6,150 +6,239 @@ import android.media.AudioDeviceInfo
 import android.media.AudioFormat
 import android.media.AudioManager
 import android.media.AudioTrack
+import android.os.Build
+import android.os.Process
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicLong
 import kotlin.math.PI
 import kotlin.math.exp
 import kotlin.math.sin
 
 object ToneGeneratorEngine {
-    private const val SAMPLE_RATE = 48000 // معدل 48kHz لتفعيل معالج الصوت والدولبي أتموس بالكامل
+    private const val SAMPLE_RATE = 48000
 
     @Volatile var outputMode: Int = 0 // 0 = التابلت + الإيربودز | 1 = التابلت فقط | 2 = الإيربودز فقط
-    @Volatile var baseFrequencyHz: Double = 105.0 // تردد الرنين المثالي لهيكل Tab A7
+    @Volatile var baseFrequencyHz: Double = 105.0
     @Volatile var volumeGain: Float = 0.90f
     @Volatile var enabled: Boolean = true
 
-    private val isPlaying = AtomicBoolean(false)
-    @Volatile private var currentTrack: AudioTrack? = null
-    @Volatile private var playThread: Thread? = null
+    private val isEngineRunning = AtomicBoolean(false)
+    private val needsTrackRebuild = AtomicBoolean(false)
+
+    // حالة النبضة الحالية (تُحدّث لحظياً بدون Locks أو إنشاء Threads)
+    private val remainingSamples = AtomicLong(0L)
+    private val totalPulseSamples = AtomicLong(1L)
+    private val currentPulseSample = AtomicLong(0L)
+    private val currentAmplitude = AtomicInteger(0)
+
+    @Volatile private var appContext: Context? = null
+
+    fun ensureStarted(context: Context?) {
+        if (context != null) {
+            appContext = context.applicationContext ?: context
+        }
+        if (isEngineRunning.compareAndSet(false, true)) {
+            Thread({
+                Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_AUDIO)
+                audioLoop()
+            }, "AudioHapticsEngine").start()
+        }
+    }
+
+    fun requestTrackRebuild() {
+        needsTrackRebuild.set(true)
+    }
 
     fun stopVibration() {
-        isPlaying.set(false)
-        try {
-            currentTrack?.pause()
-            currentTrack?.flush()
-            currentTrack?.release()
-        } catch (_: Throwable) {
+        // خفض متدرج سريع خلال 5 مللي ثانية لمنع أي صوت خربشة عند الإيقاف
+        val fadeSamples = (SAMPLE_RATE * 0.005).toLong()
+        if (remainingSamples.get() > fadeSamples) {
+            remainingSamples.set(fadeSamples)
         }
-        currentTrack = null
     }
 
     fun triggerVibration(context: Context?, durationMs: Long, amplitude: Int = 255) {
-        if (!enabled || context == null || durationMs <= 0) return
+        if (!enabled || durationMs <= 0) return
+        ensureStarted(context)
 
-        val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as? AudioManager ?: return
+        val ctx = appContext ?: return
+        val audioManager = ctx.getSystemService(Context.AUDIO_SERVICE) as? AudioManager ?: return
         if (audioManager.ringerMode == AudioManager.RINGER_MODE_SILENT) return
 
-        // إيقاف أي اهتزاز سابق فوراً لمنع تداخل الأصوات
-        stopVibration()
+        val safeDuration = durationMs.coerceIn(14L, 10000L)
+        val samples = ((safeDuration / 1000.0) * SAMPLE_RATE).toLong()
 
-        val ampFactor = (amplitude.coerceIn(1, 255) / 255f) * volumeGain
-        val safeDuration = durationMs.coerceIn(15L, 10000L) // دعم من 15ms وحتى 10 ثوانٍ متواصلة
-
-        isPlaying.set(true)
-        playThread = Thread {
-            playMotorSimulation(audioManager, safeDuration, ampFactor)
-        }.apply {
-            priority = Thread.MAX_PRIORITY
-            start()
-        }
+        currentAmplitude.set(amplitude.coerceIn(1, 255))
+        totalPulseSamples.set(samples)
+        currentPulseSample.set(0L)
+        remainingSamples.set(samples)
     }
 
-    private fun playMotorSimulation(audioManager: AudioManager, durationMs: Long, gain: Float) {
-        try {
-            val usage = when (outputMode) {
-                0 -> AudioAttributes.USAGE_ALARM // يخرج من السماعات الأربعة + الإيربودز معاً
-                1 -> AudioAttributes.USAGE_ASSISTANCE_SONIFICATION // السماعات الداخلية فقط
-                else -> AudioAttributes.USAGE_MEDIA // الإيربودز (البلوتوث) فقط عبر Dolby Atmos
-            }
+    private fun buildAudioTrack(audioManager: AudioManager): AudioTrack {
+        val usage = when (outputMode) {
+            0 -> AudioAttributes.USAGE_ALARM
+            1 -> AudioAttributes.USAGE_ALARM // نستخدم ALARM لتفعيل السماعات الأربعة و Dolby Atmos
+            else -> AudioAttributes.USAGE_MEDIA
+        }
 
-            val attributes = AudioAttributes.Builder()
-                .setUsage(usage)
-                .setContentType(AudioAttributes.CONTENT_TYPE_MOVIE) // تفعيل معالجة Dolby Atmos والمحيطية
-                .build()
+        val attributes = AudioAttributes.Builder()
+            .setUsage(usage)
+            .setContentType(AudioAttributes.CONTENT_TYPE_MOVIE) // تفعيل Dolby Atmos
+            .build()
 
-            val format = AudioFormat.Builder()
-                .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
-                .setSampleRate(SAMPLE_RATE)
-                .setChannelMask(AudioFormat.CHANNEL_OUT_STEREO) // ستيريو لتشغيل السماعات الأربعة معاً
-                .build()
+        val format = AudioFormat.Builder()
+            .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+            .setSampleRate(SAMPLE_RATE)
+            .setChannelMask(AudioFormat.CHANNEL_OUT_STEREO)
+            .build()
 
-            val totalFrames = ((durationMs / 1000.0) * SAMPLE_RATE).toInt()
-            // تقسيم البث لأجزاء صغيرة (Chunks) لإمكانية الإيقاف الفوري في أي لحظة
-            val chunkFrames = (SAMPLE_RATE * 0.02).toInt() // 20ms لكل دفعة
-            val minBuffer = AudioTrack.getMinBufferSize(
-                SAMPLE_RATE,
-                AudioFormat.CHANNEL_OUT_STEREO,
-                AudioFormat.ENCODING_PCM_16BIT
-            ).coerceAtLeast(chunkFrames * 4)
+        val chunkFrames = 240 // 5ms لكل دفعة لاستجابة لحظية بدون تأخير
+        val minBuf = AudioTrack.getMinBufferSize(
+            SAMPLE_RATE,
+            AudioFormat.CHANNEL_OUT_STEREO,
+            AudioFormat.ENCODING_PCM_16BIT
+        ).coerceAtLeast(chunkFrames * 8)
 
-            val track = AudioTrack.Builder()
-                .setAudioAttributes(attributes)
-                .setAudioFormat(format)
-                .setBufferSizeInBytes(minBuffer)
-                .setTransferMode(AudioTrack.MODE_STREAM)
-                .build()
+        val builder = AudioTrack.Builder()
+            .setAudioAttributes(attributes)
+            .setAudioFormat(format)
+            .setBufferSizeInBytes(minBuf)
+            .setTransferMode(AudioTrack.MODE_STREAM)
 
-            if (outputMode == 1) {
-                val speakers = audioManager.getDevices(AudioManager.GET_DEVICES_OUTPUTS)
-                val builtInSpeaker = speakers.firstOrNull { it.type == AudioDeviceInfo.TYPE_BUILTIN_SPEAKER }
-                if (builtInSpeaker != null) {
-                    track.preferredDevice = builtInSpeaker
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            builder.setPerformanceMode(AudioTrack.PERFORMANCE_MODE_LOW_LATENCY)
+        }
+
+        val track = builder.build()
+
+        // توجيه مخرج الصوت بدقة حسب اختيار المستخدم
+        val devices = audioManager.getDevices(AudioManager.GET_DEVICES_OUTPUTS)
+        when (outputMode) {
+            1 -> {
+                // إجبار الخروج من سماعات التابلت الداخلية فقط وعزل الإيربودز
+                val speaker = devices.firstOrNull { it.type == AudioDeviceInfo.TYPE_BUILTIN_SPEAKER }
+                if (speaker != null) {
+                    track.preferredDevice = speaker
                 }
             }
+            2 -> {
+                // توجيه للإيربودز / البلوتوث فقط
+                val btDevice = devices.firstOrNull {
+                    it.type == AudioDeviceInfo.TYPE_BLUETOOTH_A2DP ||
+                    it.type == AudioDeviceInfo.TYPE_BLE_HEADSET
+                }
+                if (btDevice != null) {
+                    track.preferredDevice = btDevice
+                }
+            }
+            else -> {
+                track.preferredDevice = null
+            }
+        }
 
-            currentTrack = track
-            track.play()
+        track.play()
+        return track
+    }
 
-            val stereoBuffer = ShortArray(chunkFrames * 2)
-            var framesWritten = 0
+    private fun audioLoop() {
+        val chunkFrames = 240 // 5ms per buffer
+        val stereoBuffer = ShortArray(chunkFrames * 2)
+        var track: AudioTrack? = null
+        var phasePrimary = 0.0
+        var phaseHarmonic = 0.0
+        var phaseMod = 0.0
 
-            while (isPlaying.get() && framesWritten < totalFrames) {
-                val framesToWrite = minOf(chunkFrames, totalFrames - framesWritten)
+        while (isEngineRunning.get()) {
+            try {
+                val ctx = appContext
+                if (ctx == null) {
+                    Thread.sleep(20)
+                    continue
+                }
 
-                for (i in 0 until framesToWrite) {
-                    val globalSample = framesWritten + i
-                    val timeSec = globalSample.toDouble() / SAMPLE_RATE
+                val audioManager = ctx.getSystemService(Context.AUDIO_SERVICE) as AudioManager
 
-                    // 1. ضربة انطلاق الموتور (Transient Kick) في أول 12 مللي ثانية
-                    val kickFreq = if (timeSec < 0.012) {
-                        baseFrequencyHz + 65.0 * exp(-timeSec * 250.0)
-                    } else {
-                        baseFrequencyHz
+                if (track == null || needsTrackRebuild.getAndSet(false)) {
+                    try {
+                        track?.pause()
+                        track?.flush()
+                        track?.release()
+                    } catch (_: Throwable) {
                     }
-
-                    // 2. الموجة الأساسية + توافقية ميكانيكية (Harmonic) + رعشة دوران (AM Modulation 32Hz)
-                    val primary = sin(2.0 * PI * kickFreq * timeSec)
-                    val harmonic = 0.35 * sin(2.0 * PI * (baseFrequencyHz * 2.0) * timeSec)
-                    val motorRumble = 0.82 + 0.18 * sin(2.0 * PI * 32.0 * timeSec)
-
-                    // 3. تنعيم البداية والنهاية لمنع الطقطقة (Anti-pop Envelope)
-                    val attack = (globalSample / (SAMPLE_RATE * 0.004)).coerceIn(0.0, 1.0)
-                    val remaining = totalFrames - globalSample
-                    val release = (remaining / (SAMPLE_RATE * 0.008)).coerceIn(0.0, 1.0)
-
-                    val rawSignal = (primary + harmonic) * motorRumble * attack * release
-                    val finalSample = (rawSignal * Short.MAX_VALUE * 0.72 * gain)
-                        .toInt()
-                        .coerceIn(Short.MIN_VALUE.toInt(), Short.MAX_VALUE.toInt())
-                        .toShort()
-
-                    // كتابة نفس الإشارة للقناتين اليمنى واليسرى لتشغيل كل السماعات الأربعة بقوة متساوية
-                    stereoBuffer[i * 2] = finalSample
-                    stereoBuffer[i * 2 + 1] = finalSample
+                    track = buildAudioTrack(audioManager)
                 }
 
-                track.write(stereoBuffer, 0, framesToWrite * 2)
-                framesWritten += framesToWrite
-            }
+                var rem = remainingSamples.get()
 
-            if (isPlaying.get()) {
-                track.stop()
+                if (rem <= 0L || !enabled) {
+                    // ضخ صمت تام (أصفار) للحفاظ على المسار مفتوحاً ومنع أي صوت خربشة
+                    stereoBuffer.fill(0)
+                    phasePrimary = 0.0
+                    phaseHarmonic = 0.0
+                    phaseMod = 0.0
+                    track.write(stereoBuffer, 0, stereoBuffer.size)
+                    continue
+                }
+
+                val baseFreq = baseFrequencyHz
+                val gain = (currentAmplitude.get() / 255f) * volumeGain
+                val total = totalPulseSamples.get().coerceAtLeast(1L)
+                var pos = currentPulseSample.get()
+
+                for (i in 0 until chunkFrames) {
+                    if (rem > 0L) {
+                        val timeSec = pos.toDouble() / SAMPLE_RATE
+
+                        // ضربة انطلاق الموتور في أول 10ms
+                        val instFreq = if (timeSec < 0.010) {
+                            baseFreq + 55.0 * exp(-timeSec * 300.0)
+                        } else {
+                            baseFreq
+                        }
+
+                        // تحديث الطور (Phase Accumulation) لمنع أي انقطاع أو خربشة في الموجة
+                        phasePrimary += 2.0 * PI * instFreq / SAMPLE_RATE
+                        phaseHarmonic += 2.0 * PI * (baseFreq * 2.0) / SAMPLE_RATE
+                        phaseMod += 2.0 * PI * 32.0 / SAMPLE_RATE
+
+                        if (phasePrimary > 2.0 * PI) phasePrimary -= 2.0 * PI
+                        if (phaseHarmonic > 2.0 * PI) phaseHarmonic -= 2.0 * PI
+                        if (phaseMod > 2.0 * PI) phaseMod -= 2.0 * PI
+
+                        val primary = sin(phasePrimary)
+                        val harmonic = 0.30 * sin(phaseHarmonic)
+                        val rumble = 0.84 + 0.16 * sin(phaseMod)
+
+                        // تنعيم ناعم للبداية (4ms) والنهاية (8ms)
+                        val attack = (pos / (SAMPLE_RATE * 0.004)).coerceIn(0.0, 1.0)
+                        val release = (rem / (SAMPLE_RATE * 0.008)).coerceIn(0.0, 1.0)
+
+                        val signal = (primary + harmonic) * rumble * attack * release
+                        val sample = (signal * Short.MAX_VALUE * 0.75 * gain)
+                            .toInt()
+                            .coerceIn(Short.MIN_VALUE.toInt(), Short.MAX_VALUE.toInt())
+                            .toShort()
+
+                        stereoBuffer[i * 2] = sample
+                        stereoBuffer[i * 2 + 1] = sample
+
+                        pos++
+                        rem--
+                    } else {
+                        stereoBuffer[i * 2] = 0
+                        stereoBuffer[i * 2 + 1] = 0
+                    }
+                }
+
+                currentPulseSample.set(pos)
+                remainingSamples.set(rem)
+                track.write(stereoBuffer, 0, stereoBuffer.size)
+
+            } catch (_: Throwable) {
+                track = null
+                Thread.sleep(50)
             }
-            track.release()
-        } catch (_: Throwable) {
-        } finally {
-            isPlaying.set(false)
         }
     }
 }

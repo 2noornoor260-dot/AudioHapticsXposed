@@ -140,10 +140,15 @@ class MainHook : IXposedHookLoadPackage {
             val receiver = object : BroadcastReceiver() {
                 override fun onReceive(ctx: Context?, intent: Intent?) {
                     if (intent == null) return
+                    val newMode = intent.getIntExtra("outputMode", 0)
+                    val modeChanged = ToneGeneratorEngine.outputMode != newMode
                     ToneGeneratorEngine.enabled = intent.getBooleanExtra("enabled", true)
-                    ToneGeneratorEngine.outputMode = intent.getIntExtra("outputMode", 0)
+                    ToneGeneratorEngine.outputMode = newMode
                     ToneGeneratorEngine.baseFrequencyHz = intent.getDoubleExtra("freq", 105.0)
                     ToneGeneratorEngine.volumeGain = intent.getFloatExtra("gain", 0.90f)
+                    if (modeChanged) {
+                        ToneGeneratorEngine.requestTrackRebuild()
+                    }
                 }
             }
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
