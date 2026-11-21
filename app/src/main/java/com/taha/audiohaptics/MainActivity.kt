@@ -59,32 +59,35 @@ class MainActivity : AppCompatActivity() {
             check(prefs.getInt("outputMode", 0))
         }
 
+        val initFreq = prefs.getInt("freq", 60)
         val freqLabel = TextView(this).apply {
-            text = "\nتردد الاهتزاز (50Hz - 100Hz): \${prefs.getInt("freq", 60)} Hz"
+            text = "\nتردد الاهتزاز (50Hz - 100Hz): $initFreq Hz"
         }
 
         val freqSeek = SeekBar(this).apply {
             max = 50
-            progress = prefs.getInt("freq", 60) - 50
+            progress = initFreq - 50
             setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
                 override fun onProgressChanged(sb: SeekBar?, p: Int, fromUser: Boolean) {
-                    freqLabel.text = "\nتردد الاهتزاز (50Hz - 100Hz): \${p + 50} Hz"
+                    val currentFreq = p + 50
+                    freqLabel.text = "\nتردد الاهتزاز (50Hz - 100Hz): $currentFreq Hz"
                 }
                 override fun onStartTrackingTouch(sb: SeekBar?) {}
                 override fun onStopTrackingTouch(sb: SeekBar?) {}
             })
         }
 
+        val initGain = prefs.getInt("gain", 85)
         val gainLabel = TextView(this).apply {
-            text = "\nقوة النبضة: \${prefs.getInt("gain", 85)}%"
+            text = "\nقوة النبضة: $initGain%"
         }
 
         val gainSeek = SeekBar(this).apply {
             max = 100
-            progress = prefs.getInt("gain", 85)
+            progress = initGain
             setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
                 override fun onProgressChanged(sb: SeekBar?, p: Int, fromUser: Boolean) {
-                    gainLabel.text = "\nقوة النبضة: \$p%"
+                    gainLabel.text = "\nقوة النبضة: $p%"
                 }
                 override fun onStartTrackingTouch(sb: SeekBar?) {}
                 override fun onStopTrackingTouch(sb: SeekBar?) {}
