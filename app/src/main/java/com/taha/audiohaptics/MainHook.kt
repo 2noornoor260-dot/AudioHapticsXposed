@@ -8,6 +8,8 @@ import android.content.IntentFilter
 import android.os.Build
 import android.os.CombinedVibration
 import android.os.VibrationEffect
+import android.view.HapticFeedbackConstants
+import android.view.View
 import de.robv.android.xposed.IXposedHookLoadPackage
 import de.robv.android.xposed.XC_MethodHook
 import de.robv.android.xposed.XC_MethodReplacement
@@ -20,10 +22,12 @@ class MainHook : IXposedHookLoadPackage {
     companion object {
         const val ACTION_UPDATE_PREFS = "com.taha.audiohaptics.UPDATE_PREFS"
         private var receiverRegistered = false
+        private var lastViewHapticTime = 0L
     }
 
     override fun handleLoadPackage(lpparam: XC_LoadPackage.LoadPackageParam) {
         hookVibratorCapabilities(lpparam.classLoader)
+        hookViewHapticFeedback(lpparam.classLoader)
 
         if (lpparam.packageName == "android") {
             hookSystemVibratorService(lpparam.classLoader)
@@ -36,7 +40,7 @@ class MainHook : IXposedHookLoadPackage {
             if (sysVib != null) {
                 XposedBridge.hookAllMethods(sysVib, "hasVibrator", XC_MethodReplacement.returnConstant(true))
                 XposedBridge.hookAllMethods(sysVib, "hasAmplitudeControl", XC_MethodReplacement.returnConstant(true))
-                XposedBridge.hookAllMethods(sysVib, "areAllEffectsSupported", XC_MethodReplacement.returnConstant(1)) // VIBRATION_EFFECT_SUPPORT_YES
+                XposedBridge.hookAllMethods(sysVib, "areAllEffectsSupported", XC_MethodReplacement.returnConstant(1))
                 XposedBridge.hookAllMethods(sysVib, "areAllPrimitivesSupported", XC_MethodReplacement.returnConstant(true))
             }
 
@@ -49,6 +53,55 @@ class MainHook : IXposedHookLoadPackage {
         }
     }
 
+    // اعتراض جميع تفاعلات الواجهة والإيماءات وأزرار التبديل (Switches) مباشرة
+    private fun hookViewHapticFeedback(classLoader: ClassLoader) {
+        try {
+            XposedBridge.hookAllMethods(View::class.java, "performHapticFeedback", object : XC_MethodHook() {
+                override fun beforeHookedMethod(param: MethodHookParam) {
+                    val view = param.thisObject as? View ?: return
+                    val feedbackConstant = (param.args.getOrNull(0) as? Int) ?: return
+
+                    // إجبار النظام على قبول الاهتزاز حتى لو كان معطلاً في إعدادات العرض
+                    if (param.args.size >= 2 && param.args[1] is Int) {
+                        val flags = param.args[1] as Int
+                        param.args[1] = flags or HapticFeedbackConstants.FLAG_IGNORE_VIEW_SETTING
+                    }
+
+                    lastViewHapticTime = System.currentTimeMillis()
+                    val profile = mapConstantToProfile(feedbackConstant)
+                    ToneGeneratorEngine.triggerTaptic(view.context, profile)
+                }
+            })
+        } catch (_: Throwable) {
+        }
+    }
+
+    private fun mapConstantToProfile(constant: Int): Int {
+        return when (constant) {
+            HapticFeedbackConstants.LONG_PRESS,
+            HapticFeedbackConstants.REJECT -> ToneGeneratorEngine.PROFILE_HEAVY
+
+            HapticFeedbackConstants.CLOCK_TICK,
+            HapticFeedbackConstants.TEXT_HANDLE_MOVE,
+            HapticFeedbackConstants.SEGMENT_TICK,
+            HapticFeedbackConstants.SEGMENT_FREQUENT_TICK -> ToneGeneratorEngine.PROFILE_TICK
+
+            // أزرار التبديل (Toggle ON / OFF) في الإعدادات والتطبيقات
+            21 /* TOGGLE_ON */ -> ToneGeneratorEngine.PROFILE_TOGGLE_ON
+            22 /* TOGGLE_OFF */ -> ToneGeneratorEngine.PROFILE_TOGGLE_OFF
+
+            // إيماءات السحب والرجوع (Gestures)
+            12 /* GESTURE_START */,
+            13 /* GESTURE_END */,
+            23 /* GESTURE_THRESHOLD_ACTIVATE */,
+            24 /* GESTURE_THRESHOLD_DEACTIVATE */ -> ToneGeneratorEngine.PROFILE_GESTURE
+
+            HapticFeedbackConstants.CONFIRM -> ToneGeneratorEngine.PROFILE_TOGGLE_ON
+
+            else -> ToneGeneratorEngine.PROFILE_TAP
+        }
+    }
+
     private fun hookSystemVibratorService(classLoader: ClassLoader) {
         val serviceClass = XposedHelpers.findClassIfExists(
             "com.android.server.vibrator.VibratorManagerService",
@@ -58,7 +111,6 @@ class MainHook : IXposedHookLoadPackage {
             classLoader
         ) ?: return
 
-        // اعتراض جميع أوامر التشغيل (vibrate)
         XposedBridge.hookAllMethods(serviceClass, "vibrate", object : XC_MethodHook() {
             override fun beforeHookedMethod(param: MethodHookParam) {
                 val context = AndroidAppHelper.currentApplication()?.applicationContext
@@ -68,12 +120,24 @@ class MainHook : IXposedHookLoadPackage {
                     registerSettingsReceiver(context)
                 }
 
+                // تجنب التكرار المزدوج إذا تم التقاط النقرة للتو عبر View.performHapticFeedback
+                val now = System.currentTimeMillis()
                 val (duration, amplitude) = extractVibrationParams(param.args)
-                ToneGeneratorEngine.triggerVibration(context, duration, amplitude)
+                if (duration <= 40L && (now - lastViewHapticTime) < 18L) {
+                    return
+                }
+
+                val profile = when {
+                    duration <= 12L -> ToneGeneratorEngine.PROFILE_TICK
+                    duration <= 28L -> ToneGeneratorEngine.PROFILE_TAP
+                    duration <= 50L -> ToneGeneratorEngine.PROFILE_HEAVY
+                    else -> ToneGeneratorEngine.PROFILE_CONTINUOUS
+                }
+
+                ToneGeneratorEngine.triggerTaptic(context, profile, duration, amplitude)
             }
         })
 
-        // اعتراض أوامر الإيقاف الفوري (cancelVibrate)
         XposedBridge.hookAllMethods(serviceClass, "cancelVibrate", object : XC_MethodHook() {
             override fun beforeHookedMethod(param: MethodHookParam) {
                 ToneGeneratorEngine.stopVibration()
@@ -82,30 +146,22 @@ class MainHook : IXposedHookLoadPackage {
     }
 
     private fun extractVibrationParams(args: Array<Any?>): Pair<Long, Int> {
-        var duration = 30L
+        var duration = 22L
         var amplitude = 220
 
         for (arg in args) {
             if (arg == null) continue
-
-            // 1. مدة مباشرة بالملي ثانية
             if (arg is Long && arg > 0) {
                 duration = arg
                 break
             }
-
-            // 2. استخراج المدة والشدة من CombinedVibration (أندرويد 12+)
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S && arg is CombinedVibration) {
                 try {
                     val effect = XposedHelpers.callMethod(arg, "getEffect") as? VibrationEffect
-                    if (effect != null) {
-                        return parseVibrationEffect(effect)
-                    }
+                    if (effect != null) return parseVibrationEffect(effect)
                 } catch (_: Throwable) {
                 }
             }
-
-            // 3. استخراج المدة والشدة من VibrationEffect مباشرة
             if (arg is VibrationEffect) {
                 return parseVibrationEffect(arg)
             }
@@ -115,14 +171,11 @@ class MainHook : IXposedHookLoadPackage {
 
     private fun parseVibrationEffect(effect: VibrationEffect): Pair<Long, Int> {
         try {
-            // إذا كان OneShot
             val dur = XposedHelpers.callMethod(effect, "getDuration") as? Long
             if (dur != null && dur > 0) {
                 val amp = (XposedHelpers.callMethod(effect, "getAmplitude") as? Int) ?: 220
                 return Pair(dur, if (amp == -1) 220 else amp)
             }
-
-            // إذا كان Waveform (اهتزاز متقطع أو طويل)
             val timings = XposedHelpers.callMethod(effect, "getTimings") as? LongArray
             if (timings != null && timings.isNotEmpty()) {
                 val total = timings.sum()
@@ -130,8 +183,7 @@ class MainHook : IXposedHookLoadPackage {
             }
         } catch (_: Throwable) {
         }
-        // النقرات الجاهزة (Click / Tick / Heavy Click)
-        return Pair(24L, 210)
+        return Pair(18L, 210)
     }
 
     private fun registerSettingsReceiver(context: Context) {
@@ -144,8 +196,8 @@ class MainHook : IXposedHookLoadPackage {
                     val modeChanged = ToneGeneratorEngine.outputMode != newMode
                     ToneGeneratorEngine.enabled = intent.getBooleanExtra("enabled", true)
                     ToneGeneratorEngine.outputMode = newMode
-                    ToneGeneratorEngine.baseFrequencyHz = intent.getDoubleExtra("freq", 105.0)
-                    ToneGeneratorEngine.volumeGain = intent.getFloatExtra("gain", 0.90f)
+                    ToneGeneratorEngine.baseFrequencyHz = intent.getDoubleExtra("freq", 85.0)
+                    ToneGeneratorEngine.volumeGain = intent.getFloatExtra("gain", 0.95f)
                     if (modeChanged) {
                         ToneGeneratorEngine.requestTrackRebuild()
                     }

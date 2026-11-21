@@ -25,7 +25,7 @@ class MainActivity : AppCompatActivity() {
         }
 
         val title = TextView(this).apply {
-            text = "إعدادات الاهتزاز الصوتي المطور (v3.0)"
+            text = "إعدادات محرك Taptic Engine الصوتي (v4.0)"
             textSize = 20f
             setPadding(0, 0, 0, 24)
         }
@@ -47,25 +47,25 @@ class MainActivity : AppCompatActivity() {
             check(prefs.getInt("outputMode", 0))
         }
 
-        val initFreq = prefs.getInt("freq", 105)
+        val initFreq = prefs.getInt("freq", 85)
         val freqLabel = TextView(this).apply {
-            text = "\nتردد الموتور (75Hz - 145Hz): $initFreq Hz"
+            text = "\nتردد الرنين الفيزيائي (65Hz - 115Hz): $initFreq Hz"
         }
 
         val freqSeek = SeekBar(this).apply {
-            max = 70
-            progress = initFreq - 75
+            max = 50
+            progress = initFreq - 65
             setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
                 override fun onProgressChanged(sb: SeekBar?, p: Int, fromUser: Boolean) {
-                    val currentFreq = p + 75
-                    freqLabel.text = "\nتردد الموتور (75Hz - 145Hz): $currentFreq Hz"
+                    val currentFreq = p + 65
+                    freqLabel.text = "\nتردد الرنين الفيزيائي (65Hz - 115Hz): $currentFreq Hz"
                 }
                 override fun onStartTrackingTouch(sb: SeekBar?) {}
                 override fun onStopTrackingTouch(sb: SeekBar?) {}
             })
         }
 
-        val initGain = prefs.getInt("gain", 90)
+        val initGain = prefs.getInt("gain", 95)
         val gainLabel = TextView(this).apply {
             text = "\nقوة الاهتزاز: $initGain%"
         }
@@ -83,18 +83,26 @@ class MainActivity : AppCompatActivity() {
         }
 
         val testTapBtn = Button(this).apply {
-            text = "حفظ وتجربة نقرة لمس سريعة (Tap)"
+            text = "حفظ وتجربة نقرة Taptic سريعة"
             setOnClickListener {
-                saveAndSync(prefs, enableSwitch.isChecked, radioGroup.checkedRadioButtonId, freqSeek.progress + 75, gainSeek.progress)
-                ToneGeneratorEngine.triggerVibration(this@MainActivity, 32L, 230)
+                saveAndSync(prefs, enableSwitch.isChecked, radioGroup.checkedRadioButtonId, freqSeek.progress + 65, gainSeek.progress)
+                ToneGeneratorEngine.triggerTaptic(this@MainActivity, ToneGeneratorEngine.PROFILE_TAP)
+            }
+        }
+
+        val testToggleBtn = Button(this).apply {
+            text = "تجربة زر التبديل (Switch ON/OFF)"
+            setOnClickListener {
+                saveAndSync(prefs, enableSwitch.isChecked, radioGroup.checkedRadioButtonId, freqSeek.progress + 65, gainSeek.progress)
+                ToneGeneratorEngine.triggerTaptic(this@MainActivity, ToneGeneratorEngine.PROFILE_TOGGLE_ON)
             }
         }
 
         val testLongBtn = Button(this).apply {
             text = "تجربة اهتزاز متواصل (1.5 ثانية)"
             setOnClickListener {
-                saveAndSync(prefs, enableSwitch.isChecked, radioGroup.checkedRadioButtonId, freqSeek.progress + 75, gainSeek.progress)
-                ToneGeneratorEngine.triggerVibration(this@MainActivity, 1500L, 255)
+                saveAndSync(prefs, enableSwitch.isChecked, radioGroup.checkedRadioButtonId, freqSeek.progress + 65, gainSeek.progress)
+                ToneGeneratorEngine.triggerTaptic(this@MainActivity, ToneGeneratorEngine.PROFILE_CONTINUOUS, 1500L, 255)
             }
         }
 
@@ -107,6 +115,7 @@ class MainActivity : AppCompatActivity() {
         layout.addView(gainLabel)
         layout.addView(gainSeek)
         layout.addView(testTapBtn)
+        layout.addView(testToggleBtn)
         layout.addView(testLongBtn)
 
         setContentView(layout)
