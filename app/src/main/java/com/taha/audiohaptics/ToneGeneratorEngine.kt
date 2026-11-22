@@ -111,7 +111,7 @@ object ToneGeneratorEngine {
             releasePool(doublePool)
 
             val f = baseFrequencyHz
-            val g = volumeGain
+            val g = volumeGain.toDouble()
 
             // 1. نقرة خفيفة (Tick - 12ms)
             val tickPcm = generateTapticPcm(durMs = 12, fStart = f * 1.25, fEnd = f * 0.95, gain = g * 0.65)
@@ -144,7 +144,7 @@ object ToneGeneratorEngine {
     }
 
     // توليد موجة Taptic فيزيائية مغلقة (Zero-Crossing + Hann Window) بدون أي خروشة
-    private fun generateTapticPcm(durMs: Int, fStart: Double, fEnd: Double, gain: Float): ShortArray {
+    private fun generateTapticPcm(durMs: Int, fStart: Double, fEnd: Double, gain: Double): ShortArray {
         val frames = ((durMs / 1000.0) * SAMPLE_RATE).toInt()
         val stereo = ShortArray(frames * 2)
         var phase = 0.0
@@ -169,7 +169,7 @@ object ToneGeneratorEngine {
         return stereo
     }
 
-    private fun generateDoubleTapticPcm(f: Double, gain: Float): ShortArray {
+    private fun generateDoubleTapticPcm(f: Double, gain: Double): ShortArray {
         val p1 = generateTapticPcm(14, f * 1.15, f * 0.90, gain * 0.80)
         val gap = ShortArray(((0.022) * SAMPLE_RATE).toInt() * 2) // 22ms صمت بين النبضتين
         val p2 = generateTapticPcm(18, f * 1.35, f * 0.88, gain * 1.05)
