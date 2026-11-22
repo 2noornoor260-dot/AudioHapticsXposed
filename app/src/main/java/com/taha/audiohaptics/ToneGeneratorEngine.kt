@@ -43,7 +43,7 @@ object ToneGeneratorEngine {
     private val doubleIdx = AtomicInteger(0)
 
     private var cachedFreq = -1.0
-    private var cachedGain = -1f
+    private var cachedGain = -1.0
     private var cachedMode = -1
 
     // للتحكم في الاهتزاز المتواصل فقط
@@ -98,20 +98,21 @@ object ToneGeneratorEngine {
     }
 
     private fun ensurePoolsBuilt(audioManager: AudioManager) {
-        if (tapPool != null && cachedFreq == baseFrequencyHz && cachedGain == volumeGain && cachedMode == outputMode) {
+        val f = baseFrequencyHz
+        val g = volumeGain.toDouble()
+        val m = outputMode
+
+        if (tapPool != null && cachedFreq == f && cachedGain == g && cachedMode == m) {
             return
         }
         synchronized(poolLock) {
-            if (tapPool != null && cachedFreq == baseFrequencyHz && cachedGain == volumeGain && cachedMode == outputMode) {
+            if (tapPool != null && cachedFreq == f && cachedGain == g && cachedMode == m) {
                 return
             }
             releasePool(tapPool)
             releasePool(tickPool)
             releasePool(heavyPool)
             releasePool(doublePool)
-
-            val f = baseFrequencyHz
-            val g = volumeGain.toDouble()
 
             // 1. نقرة خفيفة (Tick - 12ms)
             val tickPcm = generateTapticPcm(durMs = 12, fStart = f * 1.25, fEnd = f * 0.95, gain = g * 0.65)
@@ -129,7 +130,7 @@ object ToneGeneratorEngine {
 
             cachedFreq = f
             cachedGain = g
-            cachedMode = outputMode
+            cachedMode = m
         }
     }
 
