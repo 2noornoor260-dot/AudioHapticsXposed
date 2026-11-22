@@ -7,146 +7,180 @@ import android.media.AudioFormat
 import android.media.AudioManager
 import android.media.AudioTrack
 import android.os.Build
-import android.os.Process
+import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 import kotlin.math.PI
-import kotlin.math.exp
+import kotlin.math.cos
 import kotlin.math.sin
 
 object ToneGeneratorEngine {
     private const val SAMPLE_RATE = 48000
 
-    // أنماط Taptic Engine المختلفة
-    const val PROFILE_TAP = 0
-    const val PROFILE_TICK = 1
-    const val PROFILE_TOGGLE_ON = 2
-    const val PROFILE_TOGGLE_OFF = 3
-    const val PROFILE_GESTURE = 4
-    const val PROFILE_HEAVY = 5
-    const val PROFILE_CONTINUOUS = 6
+    const val TYPE_TICK = 0
+    const val TYPE_TAP = 1
+    const val TYPE_DOUBLE_TAP = 2
+    const val TYPE_HEAVY = 3
+    const val TYPE_CONTINUOUS = 4
 
     @Volatile var outputMode: Int = 0 // 0 = التابلت + الإيربودز | 1 = التابلت فقط | 2 = الإيربودز فقط
-    @Volatile var baseFrequencyHz: Double = 85.0 // تردد Taptic Engine العميق (بدون صوت مزعج)
+    @Volatile var baseFrequencyHz: Double = 118.0 // التردد الرنيني المثالي لهيكل Tab A7
     @Volatile var volumeGain: Float = 0.95f
     @Volatile var enabled: Boolean = true
 
-    private val isEngineRunning = AtomicBoolean(false)
-    private val needsTrackRebuild = AtomicBoolean(false)
-    @Volatile private var appContext: Context? = null
+    private val shortExecutor = Executors.newSingleThreadExecutor()
+    private val poolLock = Any()
 
-    // قناة صوتية مستقلة لكل نبضة (Polyphonic Voice) لمنع تداخل الموجات والخروشة
-    private class TapticVoice {
-        @Volatile var active = false
-        var pos = 0
-        var totalSamples = 0
-        var startFreq = 85.0
-        var endFreq = 85.0
-        var damping = 0.0
-        var gain = 1.0
-        var phase = 0.0
-        var delaySamples = 0 // لدعم النبضات المزدوجة (Double-tap Taptic)
+    // مسارات STATIC جاهزة في الذاكرة لعزف فوري بدون تأخير أو خروشة
+    private var tapPool: Array<AudioTrack>? = null
+    private var tickPool: Array<AudioTrack>? = null
+    private var heavyPool: Array<AudioTrack>? = null
+    private var doublePool: Array<AudioTrack>? = null
+
+    private val tapIdx = AtomicInteger(0)
+    private val tickIdx = AtomicInteger(0)
+    private val heavyIdx = AtomicInteger(0)
+    private val doubleIdx = AtomicInteger(0)
+
+    private var cachedFreq = -1.0
+    private var cachedGain = -1f
+    private var cachedMode = -1
+
+    // للتحكم في الاهتزاز المتواصل فقط
+    private val isContinuousPlaying = AtomicBoolean(false)
+    @Volatile private var continuousTrack: AudioTrack? = null
+
+    fun invalidatePools() {
+        cachedMode = -1
     }
 
-    private val voices = Array(8) { TapticVoice() }
-    private val voiceLock = Any()
-
-    fun ensureStarted(context: Context?) {
-        if (context != null) {
-            appContext = context.applicationContext ?: context
+    fun stopContinuous() {
+        isContinuousPlaying.set(false)
+        try {
+            continuousTrack?.pause()
+            continuousTrack?.flush()
+            continuousTrack?.release()
+        } catch (_: Throwable) {
         }
-        if (isEngineRunning.compareAndSet(false, true)) {
-            Thread({
-                Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_AUDIO)
-                audioLoop()
-            }, "TapticSynthesizer").start()
-        }
+        continuousTrack = null
     }
 
-    fun requestTrackRebuild() {
-        needsTrackRebuild.set(true)
-    }
+    fun trigger(context: Context?, type: Int, durationMs: Long = 20L, amplitude: Int = 240) {
+        if (!enabled || context == null || amplitude <= 0) return
 
-    fun stopVibration() {
-        synchronized(voiceLock) {
-            for (v in voices) {
-                if (v.active && v.totalSamples - v.pos > 240) {
-                    v.totalSamples = v.pos + 240 // إخماد ناعم خلال 5ms
-                }
-            }
-        }
-    }
-
-    fun triggerTaptic(context: Context?, profile: Int, durationMs: Long = 20L, amplitude: Int = 230) {
-        if (!enabled) return
-        ensureStarted(context)
-
-        val ctx = appContext ?: return
-        val audioManager = ctx.getSystemService(Context.AUDIO_SERVICE) as? AudioManager ?: return
+        val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as? AudioManager ?: return
         if (audioManager.ringerMode == AudioManager.RINGER_MODE_SILENT) return
 
-        val ampNorm = (amplitude.coerceIn(1, 255) / 255.0) * volumeGain
-        val base = baseFrequencyHz
+        if (type == TYPE_CONTINUOUS && durationMs > 65L) {
+            startContinuous(audioManager, durationMs.coerceAtMost(10000L), amplitude)
+            return
+        }
 
-        when (profile) {
-            PROFILE_TICK -> {
-                // نبضة دقيقة جداً للتمرير والقوائم (7ms)
-                spawnVoice(delayMs = 0, durMs = 8, fStart = base + 12.0, fEnd = base, damp = 180.0, gain = ampNorm * 0.55)
-            }
-            PROFILE_TAP -> {
-                // نقرة Taptic حادة ومكتومة الصوت (13ms)
-                spawnVoice(delayMs = 0, durMs = 13, fStart = base + 18.0, fEnd = base - 5.0, damp = 140.0, gain = ampNorm * 0.90)
-            }
-            PROFILE_TOGGLE_ON -> {
-                // نبضة مزدوجة صاعدة لتشغيل المفتاح (Switch ON)
-                spawnVoice(delayMs = 0, durMs = 10, fStart = base - 8.0, fEnd = base, damp = 160.0, gain = ampNorm * 0.65)
-                spawnVoice(delayMs = 24, durMs = 14, fStart = base + 15.0, fEnd = base + 5.0, damp = 130.0, gain = ampNorm * 1.0)
-            }
-            PROFILE_TOGGLE_OFF -> {
-                // نبضة مزدوجة هابطة لإطفاء المفتاح (Switch OFF)
-                spawnVoice(delayMs = 0, durMs = 12, fStart = base + 10.0, fEnd = base, damp = 140.0, gain = ampNorm * 0.85)
-                spawnVoice(delayMs = 22, durMs = 10, fStart = base - 5.0, fEnd = base - 15.0, damp = 170.0, gain = ampNorm * 0.55)
-            }
-            PROFILE_GESTURE -> {
-                // إحساس سحبة إيماءة الرجوع المرنة (18ms)
-                spawnVoice(delayMs = 0, durMs = 18, fStart = base - 10.0, fEnd = base + 14.0, damp = 95.0, gain = ampNorm * 0.95)
-            }
-            PROFILE_HEAVY -> {
-                // ضغطة عميقة للضغط المطوّل (36ms)
-                spawnVoice(delayMs = 0, durMs = 36, fStart = base + 8.0, fEnd = base - 12.0, damp = 55.0, gain = ampNorm * 1.15)
-            }
-            else -> {
-                // اهتزاز مستمر (رنين أو ألعاب)
-                val safeDur = durationMs.coerceIn(14L, 10000L)
-                spawnVoice(delayMs = 0, durMs = safeDur, fStart = base + 10.0, fEnd = base, damp = 0.0, gain = ampNorm)
+        shortExecutor.execute {
+            try {
+                ensurePoolsBuilt(audioManager)
+                val track = when (type) {
+                    TYPE_TICK -> tickPool?.let { it[tickIdx.getAndIncrement() % it.size] }
+                    TYPE_DOUBLE_TAP -> doublePool?.let { it[doubleIdx.getAndIncrement() % it.size] }
+                    TYPE_HEAVY -> heavyPool?.let { it[heavyIdx.getAndIncrement() % it.size] }
+                    else -> tapPool?.let { it[tapIdx.getAndIncrement() % it.size] }
+                } ?: return@execute
+
+                if (track.playState == AudioTrack.PLAYSTATE_PLAYING) {
+                    track.stop()
+                }
+                track.reloadStaticData()
+                track.play()
+            } catch (_: Throwable) {
+                invalidatePools()
             }
         }
     }
 
-    private fun spawnVoice(delayMs: Long, durMs: Long, fStart: Double, fEnd: Double, damp: Double, gain: Double) {
-        synchronized(voiceLock) {
-            // اختيار قناة خاملة أو أقدم قناة
-            val voice = voices.firstOrNull { !it.active } ?: voices.maxByOrNull { it.pos } ?: return
-            voice.delaySamples = ((delayMs / 1000.0) * SAMPLE_RATE).toInt()
-            voice.totalSamples = ((durMs / 1000.0) * SAMPLE_RATE).toInt().coerceAtLeast(120)
-            voice.pos = 0
-            voice.startFreq = fStart
-            voice.endFreq = fEnd
-            voice.damping = damp
-            voice.gain = gain
-            voice.phase = 0.0
-            voice.active = true
+    private fun ensurePoolsBuilt(audioManager: AudioManager) {
+        if (tapPool != null && cachedFreq == baseFrequencyHz && cachedGain == volumeGain && cachedMode == outputMode) {
+            return
+        }
+        synchronized(poolLock) {
+            if (tapPool != null && cachedFreq == baseFrequencyHz && cachedGain == volumeGain && cachedMode == outputMode) {
+                return
+            }
+            releasePool(tapPool)
+            releasePool(tickPool)
+            releasePool(heavyPool)
+            releasePool(doublePool)
+
+            val f = baseFrequencyHz
+            val g = volumeGain
+
+            // 1. نقرة خفيفة (Tick - 12ms)
+            val tickPcm = generateTapticPcm(durMs = 12, fStart = f * 1.25, fEnd = f * 0.95, gain = g * 0.65)
+            // 2. نقرة أساسية قوية وواضحة (Tap - 18ms)
+            val tapPcm = generateTapticPcm(durMs = 18, fStart = f * 1.32, fEnd = f * 0.85, gain = g * 1.0)
+            // 3. نقرة عميقة للضغط المطوّل و Recent Apps (Heavy - 34ms)
+            val heavyPcm = generateTapticPcm(durMs = 34, fStart = f * 1.20, fEnd = f * 0.78, gain = g * 1.15)
+            // 4. نقرة مزدوجة لأزرار التبديل (Double Tap - 55ms)
+            val doublePcm = generateDoubleTapticPcm(f = f, gain = g)
+
+            tickPool = Array(4) { buildStaticTrack(audioManager, tickPcm) }
+            tapPool = Array(6) { buildStaticTrack(audioManager, tapPcm) }
+            heavyPool = Array(3) { buildStaticTrack(audioManager, heavyPcm) }
+            doublePool = Array(3) { buildStaticTrack(audioManager, doublePcm) }
+
+            cachedFreq = f
+            cachedGain = g
+            cachedMode = outputMode
         }
     }
 
-    private fun buildAudioTrack(audioManager: AudioManager): AudioTrack {
-        val usage = when (outputMode) {
-            2 -> AudioAttributes.USAGE_MEDIA
-            else -> AudioAttributes.USAGE_ALARM
+    private fun releasePool(pool: Array<AudioTrack>?) {
+        pool?.forEach {
+            try {
+                it.stop()
+                it.release()
+            } catch (_: Throwable) {
+            }
         }
+    }
 
+    // توليد موجة Taptic فيزيائية مغلقة (Zero-Crossing + Hann Window) بدون أي خروشة
+    private fun generateTapticPcm(durMs: Int, fStart: Double, fEnd: Double, gain: Float): ShortArray {
+        val frames = ((durMs / 1000.0) * SAMPLE_RATE).toInt()
+        val stereo = ShortArray(frames * 2)
+        var phase = 0.0
+
+        for (i in 0 until frames) {
+            val progress = i.toDouble() / frames
+            // نافذة Hann الناعمة تجعل البداية 0 والنهاية 0 تماماً بدون أي طقطقة
+            val window = 0.5 * (1.0 - cos(2.0 * PI * progress))
+            val instFreq = fStart + (fEnd - fStart) * progress
+            phase += 2.0 * PI * instFreq / SAMPLE_RATE
+
+            // مزيج متوازن يعطي إحساس الارتطام الميكانيكي القوي في سماعات التابلت
+            val wave = sin(phase) + 0.25 * sin(2.0 * phase)
+            val sample = (wave * window * Short.MAX_VALUE * 0.78 * gain)
+                .toInt()
+                .coerceIn(Short.MIN_VALUE.toInt(), Short.MAX_VALUE.toInt())
+                .toShort()
+
+            stereo[i * 2] = sample
+            stereo[i * 2 + 1] = sample
+        }
+        return stereo
+    }
+
+    private fun generateDoubleTapticPcm(f: Double, gain: Float): ShortArray {
+        val p1 = generateTapticPcm(14, f * 1.15, f * 0.90, gain * 0.80)
+        val gap = ShortArray(((0.022) * SAMPLE_RATE).toInt() * 2) // 22ms صمت بين النبضتين
+        val p2 = generateTapticPcm(18, f * 1.35, f * 0.88, gain * 1.05)
+        return p1 + gap + p2
+    }
+
+    private fun buildStaticTrack(audioManager: AudioManager, pcmData: ShortArray): AudioTrack {
+        val usage = if (outputMode == 2) AudioAttributes.USAGE_MEDIA else AudioAttributes.USAGE_ALARM
         val attributes = AudioAttributes.Builder()
             .setUsage(usage)
-            .setContentType(AudioAttributes.CONTENT_TYPE_MOVIE) // تفعيل السماعات الأربعة و Dolby Atmos
+            .setContentType(AudioAttributes.CONTENT_TYPE_MOVIE)
             .build()
 
         val format = AudioFormat.Builder()
@@ -155,25 +189,19 @@ object ToneGeneratorEngine {
             .setChannelMask(AudioFormat.CHANNEL_OUT_STEREO)
             .build()
 
-        // استخدام الحد الأدنى الحقيقي للـ Buffer لإزالة التأخير تماماً
-        val minBuf = AudioTrack.getMinBufferSize(
-            SAMPLE_RATE,
-            AudioFormat.CHANNEL_OUT_STEREO,
-            AudioFormat.ENCODING_PCM_16BIT
-        )
-
-        val builder = AudioTrack.Builder()
+        val track = AudioTrack.Builder()
             .setAudioAttributes(attributes)
             .setAudioFormat(format)
-            .setBufferSizeInBytes(minBuf)
-            .setTransferMode(AudioTrack.MODE_STREAM)
+            .setBufferSizeInBytes(pcmData.size * 2)
+            .setTransferMode(AudioTrack.MODE_STATIC)
+            .build()
 
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            builder.setPerformanceMode(AudioTrack.PERFORMANCE_MODE_LOW_LATENCY)
-        }
+        applyOutputRouting(audioManager, track)
+        track.write(pcmData, 0, pcmData.size)
+        return track
+    }
 
-        val track = builder.build()
-
+    private fun applyOutputRouting(audioManager: AudioManager, track: AudioTrack) {
         val devices = audioManager.getDevices(AudioManager.GET_DEVICES_OUTPUTS)
         when (outputMode) {
             1 -> {
@@ -181,109 +209,92 @@ object ToneGeneratorEngine {
                 if (speaker != null) track.preferredDevice = speaker
             }
             2 -> {
-                val btDevice = devices.firstOrNull {
+                val bt = devices.firstOrNull {
                     it.type == AudioDeviceInfo.TYPE_BLUETOOTH_A2DP ||
                     it.type == AudioDeviceInfo.TYPE_BLE_HEADSET
                 }
-                if (btDevice != null) track.preferredDevice = btDevice
+                if (bt != null) track.preferredDevice = bt
             }
             else -> track.preferredDevice = null
         }
-
-        track.play()
-        return track
     }
 
-    private fun audioLoop() {
-        val chunkFrames = 128 // ~2.6ms فقط لكل دفعة لاستجابة فورية
-        val stereoBuffer = ShortArray(chunkFrames * 2)
-        var track: AudioTrack? = null
+    // محرك مستقل للاهتزاز المتواصل بتموج موتور 36Hz (يشبه الموتور الفعلي وليس صفارة)
+    private fun startContinuous(audioManager: AudioManager, durationMs: Long, amplitude: Int) {
+        stopContinuous()
+        isContinuousPlaying.set(true)
+        val ampGain = (amplitude.coerceIn(1, 255) / 255.0) * volumeGain
 
-        while (isEngineRunning.get()) {
+        Thread {
             try {
-                val ctx = appContext
-                if (ctx == null) {
-                    Thread.sleep(15)
-                    continue
-                }
+                val usage = if (outputMode == 2) AudioAttributes.USAGE_MEDIA else AudioAttributes.USAGE_ALARM
+                val attributes = AudioAttributes.Builder()
+                    .setUsage(usage)
+                    .setContentType(AudioAttributes.CONTENT_TYPE_MOVIE)
+                    .build()
 
-                val audioManager = ctx.getSystemService(Context.AUDIO_SERVICE) as AudioManager
+                val format = AudioFormat.Builder()
+                    .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                    .setSampleRate(SAMPLE_RATE)
+                    .setChannelMask(AudioFormat.CHANNEL_OUT_STEREO)
+                    .build()
 
-                if (track == null || needsTrackRebuild.getAndSet(false)) {
-                    try {
-                        track?.pause()
-                        track?.flush()
-                        track?.release()
-                    } catch (_: Throwable) {
+                val chunkFrames = 1440 // 30ms buffer لمنع أي تقطع في الاهتزاز الطويل
+                val minBuf = AudioTrack.getMinBufferSize(
+                    SAMPLE_RATE,
+                    AudioFormat.CHANNEL_OUT_STEREO,
+                    AudioFormat.ENCODING_PCM_16BIT
+                ).coerceAtLeast(chunkFrames * 4)
+
+                val track = AudioTrack.Builder()
+                    .setAudioAttributes(attributes)
+                    .setAudioFormat(format)
+                    .setBufferSizeInBytes(minBuf)
+                    .setTransferMode(AudioTrack.MODE_STREAM)
+                    .build()
+
+                applyOutputRouting(audioManager, track)
+                continuousTrack = track
+                track.play()
+
+                val totalFrames = ((durationMs / 1000.0) * SAMPLE_RATE).toInt()
+                val buf = ShortArray(chunkFrames * 2)
+                var written = 0
+                val f = baseFrequencyHz
+
+                while (isContinuousPlaying.get() && written < totalFrames) {
+                    val toWrite = minOf(chunkFrames, totalFrames - written)
+                    for (i in 0 until toWrite) {
+                        val pos = written + i
+                        val t = pos.toDouble() / SAMPLE_RATE
+
+                        // تموج دوران موتور ERM حقيقي (36 نبضة في الثانية)
+                        val motorPulse = 0.45 + 0.55 * (0.5 * (1.0 + sin(2.0 * PI * 36.0 * t)))
+                        val carrier = sin(2.0 * PI * f * t) + 0.25 * sin(2.0 * PI * (f * 2.0) * t)
+
+                        val fadeIn = (pos / (SAMPLE_RATE * 0.015)).coerceIn(0.0, 1.0)
+                        val fadeOut = ((totalFrames - pos) / (SAMPLE_RATE * 0.020)).coerceIn(0.0, 1.0)
+
+                        val s = (carrier * motorPulse * fadeIn * fadeOut * Short.MAX_VALUE * 0.72 * ampGain)
+                            .toInt()
+                            .coerceIn(Short.MIN_VALUE.toInt(), Short.MAX_VALUE.toInt())
+                            .toShort()
+
+                        buf[i * 2] = s
+                        buf[i * 2 + 1] = s
                     }
-                    track = buildAudioTrack(audioManager)
+                    track.write(buf, 0, toWrite * 2)
+                    written += toWrite
                 }
 
-                var anyActive = false
-                for (v in voices) {
-                    if (v.active) {
-                        anyActive = true
-                        break
-                    }
+                if (isContinuousPlaying.get()) {
+                    track.stop()
                 }
-
-                if (!anyActive || !enabled) {
-                    stereoBuffer.fill(0)
-                    track.write(stereoBuffer, 0, stereoBuffer.size)
-                    continue
-                }
-
-                for (i in 0 until chunkFrames) {
-                    var mixedSample = 0.0
-
-                    for (v in voices) {
-                        if (!v.active) continue
-
-                        if (v.delaySamples > 0) {
-                            v.delaySamples--
-                            continue
-                        }
-
-                        val progress = v.pos.toDouble() / v.totalSamples
-                        val timeSec = v.pos.toDouble() / SAMPLE_RATE
-
-                        // تغير التردد السلس لمحاكاة تسارع وكبح الكتلة المغناطيسية
-                        val instFreq = v.startFreq + (v.endFreq - v.startFreq) * progress
-                        v.phase += 2.0 * PI * instFreq / SAMPLE_RATE
-                        if (v.phase > 2.0 * PI) v.phase -= 2.0 * PI
-
-                        // إخماد فيزيائي (Damping) + تنعيم ناعم للبداية (2ms) والنهاية (4ms)
-                        val dampingFactor = if (v.damping > 0.0) exp(-v.damping * timeSec) else (0.88 + 0.12 * sin(2.0 * PI * 30.0 * timeSec))
-                        val attack = (v.pos / (SAMPLE_RATE * 0.002)).coerceIn(0.0, 1.0)
-                        val remaining = v.totalSamples - v.pos
-                        val release = (remaining / (SAMPLE_RATE * 0.004)).coerceIn(0.0, 1.0)
-
-                        // موجة نقية بدون توافقيات حادة لإعطاء هزة فيزيائية دون صوت نقرة مزعج
-                        mixedSample += sin(v.phase) * dampingFactor * attack * release * v.gain
-
-                        v.pos++
-                        if (v.pos >= v.totalSamples) {
-                            v.active = false
-                        }
-                    }
-
-                    // محدد ناعم (Soft Limiter) لمنع التشويش عند تداخل عدة نقرات سريعة
-                    val clamped = mixedSample.coerceIn(-1.1, 1.1)
-                    val finalPcm = (clamped * Short.MAX_VALUE * 0.85)
-                        .toInt()
-                        .coerceIn(Short.MIN_VALUE.toInt(), Short.MAX_VALUE.toInt())
-                        .toShort()
-
-                    stereoBuffer[i * 2] = finalPcm
-                    stereoBuffer[i * 2 + 1] = finalPcm
-                }
-
-                track.write(stereoBuffer, 0, stereoBuffer.size)
-
+                track.release()
             } catch (_: Throwable) {
-                track = null
-                Thread.sleep(30)
+            } finally {
+                isContinuousPlaying.set(false)
             }
-        }
+        }.start()
     }
 }

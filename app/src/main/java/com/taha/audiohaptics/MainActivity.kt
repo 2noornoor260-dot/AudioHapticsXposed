@@ -25,7 +25,7 @@ class MainActivity : AppCompatActivity() {
         }
 
         val title = TextView(this).apply {
-            text = "إعدادات محرك Taptic Engine الصوتي (v4.0)"
+            text = "إعدادات الاهتزاز الصوتي الاحترافي (v5.0)"
             textSize = 20f
             setPadding(0, 0, 0, 24)
         }
@@ -47,18 +47,18 @@ class MainActivity : AppCompatActivity() {
             check(prefs.getInt("outputMode", 0))
         }
 
-        val initFreq = prefs.getInt("freq", 85)
+        val initFreq = prefs.getInt("freq", 118)
         val freqLabel = TextView(this).apply {
-            text = "\nتردد الرنين الفيزيائي (65Hz - 115Hz): $initFreq Hz"
+            text = "\nتردد الرنين (90Hz - 145Hz): $initFreq Hz"
         }
 
         val freqSeek = SeekBar(this).apply {
-            max = 50
-            progress = initFreq - 65
+            max = 55
+            progress = initFreq - 90
             setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
                 override fun onProgressChanged(sb: SeekBar?, p: Int, fromUser: Boolean) {
-                    val currentFreq = p + 65
-                    freqLabel.text = "\nتردد الرنين الفيزيائي (65Hz - 115Hz): $currentFreq Hz"
+                    val currentFreq = p + 90
+                    freqLabel.text = "\nتردد الرنين (90Hz - 145Hz): $currentFreq Hz"
                 }
                 override fun onStartTrackingTouch(sb: SeekBar?) {}
                 override fun onStopTrackingTouch(sb: SeekBar?) {}
@@ -85,24 +85,24 @@ class MainActivity : AppCompatActivity() {
         val testTapBtn = Button(this).apply {
             text = "حفظ وتجربة نقرة Taptic سريعة"
             setOnClickListener {
-                saveAndSync(prefs, enableSwitch.isChecked, radioGroup.checkedRadioButtonId, freqSeek.progress + 65, gainSeek.progress)
-                ToneGeneratorEngine.triggerTaptic(this@MainActivity, ToneGeneratorEngine.PROFILE_TAP)
+                saveAndSync(prefs, enableSwitch.isChecked, radioGroup.checkedRadioButtonId, freqSeek.progress + 90, gainSeek.progress)
+                ToneGeneratorEngine.trigger(this@MainActivity, ToneGeneratorEngine.TYPE_TAP)
             }
         }
 
-        val testToggleBtn = Button(this).apply {
-            text = "تجربة زر التبديل (Switch ON/OFF)"
+        val testDoubleBtn = Button(this).apply {
+            text = "تجربة نقرة مزدوجة (أزرار التبديل / Recent Apps)"
             setOnClickListener {
-                saveAndSync(prefs, enableSwitch.isChecked, radioGroup.checkedRadioButtonId, freqSeek.progress + 65, gainSeek.progress)
-                ToneGeneratorEngine.triggerTaptic(this@MainActivity, ToneGeneratorEngine.PROFILE_TOGGLE_ON)
+                saveAndSync(prefs, enableSwitch.isChecked, radioGroup.checkedRadioButtonId, freqSeek.progress + 90, gainSeek.progress)
+                ToneGeneratorEngine.trigger(this@MainActivity, ToneGeneratorEngine.TYPE_DOUBLE_TAP)
             }
         }
 
         val testLongBtn = Button(this).apply {
-            text = "تجربة اهتزاز متواصل (1.5 ثانية)"
+            text = "تجربة اهتزاز موتور متواصل (1.5 ثانية)"
             setOnClickListener {
-                saveAndSync(prefs, enableSwitch.isChecked, radioGroup.checkedRadioButtonId, freqSeek.progress + 65, gainSeek.progress)
-                ToneGeneratorEngine.triggerTaptic(this@MainActivity, ToneGeneratorEngine.PROFILE_CONTINUOUS, 1500L, 255)
+                saveAndSync(prefs, enableSwitch.isChecked, radioGroup.checkedRadioButtonId, freqSeek.progress + 90, gainSeek.progress)
+                ToneGeneratorEngine.trigger(this@MainActivity, ToneGeneratorEngine.TYPE_CONTINUOUS, 1500L, 255)
             }
         }
 
@@ -115,14 +115,13 @@ class MainActivity : AppCompatActivity() {
         layout.addView(gainLabel)
         layout.addView(gainSeek)
         layout.addView(testTapBtn)
-        layout.addView(testToggleBtn)
+        layout.addView(testDoubleBtn)
         layout.addView(testLongBtn)
 
         setContentView(layout)
     }
 
     private fun saveAndSync(prefs: android.content.SharedPreferences, enabled: Boolean, mode: Int, freq: Int, gain: Int) {
-        val modeChanged = ToneGeneratorEngine.outputMode != mode
         prefs.edit()
             .putBoolean("enabled", enabled)
             .putInt("outputMode", mode)
@@ -134,9 +133,7 @@ class MainActivity : AppCompatActivity() {
         ToneGeneratorEngine.outputMode = mode
         ToneGeneratorEngine.baseFrequencyHz = freq.toDouble()
         ToneGeneratorEngine.volumeGain = gain / 100f
-        if (modeChanged) {
-            ToneGeneratorEngine.requestTrackRebuild()
-        }
+        ToneGeneratorEngine.invalidatePools()
 
         val intent = Intent(MainHook.ACTION_UPDATE_PREFS).apply {
             putExtra("enabled", enabled)
